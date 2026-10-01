@@ -1,0 +1,33 @@
+services:
+  bot:
+    build: .
+    image: nailong-llm-ban
+    restart: unless-stopped
+    env_file:
+      - path: .env          # API key 放这里，可选
+        required: false
+    environment:
+      TZ: Asia/Shanghai     # /stats、/wall 的 today 等按这个时区算
+    ports:
+      - "8080:8080"         # mode: reverse 时 NapCat 连这个端口
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/data/config.yaml:ro
+
+  # 标注网页，不需要可以删掉
+  web:
+    image: nailong-llm-ban
+    restart: unless-stopped
+    command: ["nailong-web", "-c", "/data/config.yaml"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/data/config.yaml:ro
+    depends_on:
+      - bot

@@ -1,0 +1,94 @@
+onebot:
+  # reverse: 在 NapCat 里新建「WebSocket 客户端」，地址填 ws://<本机IP>:8080
+  # forward: 在 NapCat 里新建「WebSocket 服务器」，下面 url 填它的地址
+  mode: reverse
+  host: 0.0.0.0
+  port: 8080
+  url: ws://127.0.0.1:3001
+  access_token: ""          # 与 NapCat 中配置的 token 保持一致
+  api_timeout: 15
+
+# 只在这些群生效；为空则不处理任何群
+groups:
+  - 123456789
+
+# 管理员 QQ 号：可以用指令纠正判定，他们发的消息也不会被检测
+#   回复一条带图消息，发送「是奶龙」或「否奶龙」
+#   或者直接发「是奶龙」/「否奶龙」并附上图片（群里或私聊机器人都行）
+# 「是奶龙」会同时撤回被回复的那条消息
+admins: []
+# 不处理群主/管理员的消息
+skip_admins: true
+# 模型置信度 >= 该值才处理
+threshold: 0.7
+
+action:
+  recall: true
+  ban_seconds: 0            # >0 时同时禁言，单位秒
+  notice: ""                # 非空时撤回后 @ 发送者并发这句话，例如 "禁止发奶龙"
+
+# 动图处理：先去掉重复画面，再均匀挑出若干帧拼成网格发给模型
+frames:
+  max_frames: 4             # 最多几帧；调大能减少漏判，但每帧会变小（4=2x2, 9=3x3）
+  max_side: 768             # 拼图最长边像素；帧多时可适当调大，token 也会增加
+  dedupe_threshold: 8       # 两帧平均色差低于该值视为重复（0-255），0 关闭去重
+  max_scan: 300             # 超长动图最多扫描多少帧
+
+# 持续学习：从人工标注里挑正反例附在每次请求里（需要 save_dir）
+# 优先挑模型判错、被人工纠正过的难例；集合不变时请求前缀不变，可以命中服务商缓存
+examples:
+  enabled: true
+  positive: 4              # 群里用 /examples 正例数 反例数 调整后，以群里设置的为准
+  negative: 4
+  max_side: 384             # 例子图片最长边，越小越省 token
+  rebuild_seconds: 60       # 人工标注变化后最快多久重选例子；连续标注时合并成一次，减少缓存失效
+
+# 标注网页（nailong-web）
+web:
+  host: 0.0.0.0
+  port: 8081
+  token: ""                 # 访问口令；留空则每次启动随机生成并打印在日志里
+
+cache_path: nailong_cache.sqlite3
+# 样本集目录：所有检测过的图都会存下来，人工标注和模型判定分开放，另有 labels.jsonl 记录每次判定；留空不保存
+save_dir: nailong_images
+max_image_bytes: 10485760
+log_level: INFO
+
+# 按顺序尝试，前一个失败自动切换下一个。都是 OpenAI 兼容接口。
+# api_key 支持 ${环境变量} 写法。
+providers:
+  - name: kimi
+    base_url: https://api.moonshot.cn/v1
+    api_key: ${MOONSHOT_API_KEY}
+    model: moonshot-v1-8k-vision-preview   # 需使用支持图片的模型
+    vision: true
+    params:
+      temperature: 0
+      max_tokens: 200
+
+  - name: gpt
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4o-mini
+    vision: true
+    params:
+      temperature: 0
+      max_tokens: 200
+
+  # deepseek-flash（V4.1 Flash）原生支持识图；deepseek-v4-pro 目前不支持，不要用于图片检测。
+  - name: deepseek
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    model: deepseek-flash
+    vision: true
+    # 例子上限按上下文窗口算；已知模型不用填，其它模型可以写：
+    # context_window: 1048576
+    # max_images: 600
+    params:
+      # 默认开启思考（effort=high），做二分类不需要，关掉更快更省
+      extra_body:
+        thinking:
+          type: disabled
+      temperature: 0
+      max_tokens: 200

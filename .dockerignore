@@ -1,0 +1,7 @@
+*
+!pyproject.toml
+!uv.lock
+!nailong/
+nailong/__pycache__/
+!README.md
+!LICENSE
