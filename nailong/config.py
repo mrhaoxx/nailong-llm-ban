@@ -68,6 +68,14 @@ class ExamplesConfig:
 
 
 @dataclass
+class PermissionsConfig:
+    # 按群设置指令权限：{群号: {指令名: member / group_admin / admin}}；群里用 /perm 调整的优先
+    groups: dict[int, dict[str, str]] = field(default_factory=dict)
+    # 指令回复多少秒后撤回：{指令名: 秒}，0 表示不撤回；不写则用默认值
+    recall: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class WebConfig:
     host: str = "0.0.0.0"
     port: int = 8081
@@ -83,6 +91,7 @@ class Config:
     frames: FrameConfig = field(default_factory=FrameConfig)
     web: WebConfig = field(default_factory=WebConfig)
     examples: ExamplesConfig = field(default_factory=ExamplesConfig)
+    permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
     # 只处理这些群；为空则不处理任何群
     groups: list[int] = field(default_factory=list)
     # 可以用 是奶龙/否奶龙 指令纠正判定的 QQ 号，他们的消息也不会被检测
@@ -92,7 +101,8 @@ class Config:
     cache_path: str = "nailong_cache.sqlite3"
     # 样本集目录；为空则不保存
     save_dir: str = "nailong_images"
-    max_image_bytes: int = 10 * 1024 * 1024
+    # 单张图片下载上限；奶龙动图常常超过 10MB
+    max_image_bytes: int = 50 * 1024 * 1024
     log_level: str = "INFO"
 
 
@@ -107,6 +117,12 @@ def _expand(value: Any) -> Any:
     return value
 
 
+def _permissions(raw: dict[str, Any]) -> PermissionsConfig:
+    groups = {int(gid): {str(k): str(v) for k, v in (table or {}).items()} for gid, table in (raw.get("groups") or {}).items()}
+    recall = {str(k): float(v) for k, v in (raw.get("recall") or {}).items()}
+    return PermissionsConfig(groups=groups, recall=recall)
+
+
 def load_config(path: str | Path) -> Config:
     raw = _expand(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
     providers = [ProviderConfig(**p) for p in raw.pop("providers", [])]
@@ -119,5 +135,6 @@ def load_config(path: str | Path) -> Config:
         frames=FrameConfig(**raw.pop("frames", {})),
         web=WebConfig(**raw.pop("web", {})),
         examples=ExamplesConfig(**raw.pop("examples", {})),
+        permissions=_permissions(raw.pop("permissions", None) or {}),
         **raw,
     )

@@ -16,6 +16,8 @@ class Verdict:
     model: str = ""
     # 本次调用的 token 用量（只在刚调用模型时有，不写入缓存）
     usage: Any = None
+    # 模型报告图中有试图左右审核结果、或在说明角色身份的文字（只用于记录和提示，不改变结论）
+    injection: bool = False
 
 
 @dataclass

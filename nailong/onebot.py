@@ -33,7 +33,8 @@ class OneBot:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
 
-    async def call(self, action: str, **params: Any) -> Any:
+    async def call(self, action: str, timeout: float | None = None, **params: Any) -> Any:
+        """调用 NapCat API。超时、断线和失败都抛 OneBotError，调用方只需处理这一种异常。"""
         ws = self._ws
         if ws is None:
             raise OneBotError("NapCat 未连接")
@@ -42,7 +43,11 @@ class OneBot:
         self._pending[echo] = fut
         try:
             await ws.send(json.dumps({"action": action, "params": params, "echo": echo}))
-            resp = await asyncio.wait_for(fut, self.cfg.api_timeout)
+            resp = await asyncio.wait_for(fut, timeout or self.cfg.api_timeout)
+        except TimeoutError as e:
+            raise OneBotError(f"{action} 超时") from e
+        except ConnectionClosed as e:
+            raise OneBotError(f"{action} 发送时连接断开") from e
         finally:
             self._pending.pop(echo, None)
         if resp.get("status") != "ok":
