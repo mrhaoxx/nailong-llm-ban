@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import math
+import random
 from pathlib import Path
 
 import httpx
@@ -142,3 +143,32 @@ def make_collage(images: list[tuple[str, bytes] | tuple[str, bytes, tuple[int, i
     buf = io.BytesIO()
     sheet.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
+
+
+# 微噪声的标准差（0-255 像素值）；对抗扰动通常在 4~8 以内
+NOISE_SIGMA = 3.0
+
+
+def add_noise(im: Image.Image, sigma: float) -> Image.Image:
+    """每个通道叠加独立的高斯噪声（Pillow 生成的噪声以 128 为中心）。"""
+    noise = Image.merge("RGB", [Image.effect_noise(im.size, sigma) for _ in range(3)])
+    return ImageChops.add(im, noise, scale=1.0, offset=-128)
+
+
+def harden_uri(data_uri: str, rng: random.Random | None = None) -> str:
+    """对抗像素级对抗扰动（例如针对 DeepSeek 视觉编码器优化的噪声）。
+
+    这类扰动只对特定的像素与 patch 网格对齐方式有效。送给模型前随机裁掉左上角几个像素（让整张图相对 patch 网格错位），
+    再叠加肉眼看不出的随机微噪声；每次都不同，攻击者无法针对固定流程优化。
+    实测：平移就足以让针对 DeepSeek-V4.1-Flash 优化的扰动失效。不做缩放和模糊：
+    缩放（放大或缩小）会让带注入文字的图更容易骗过模型，模糊会让画面变得不确定。
+    """
+    rng = rng or random.Random()
+    im = Image.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1]))).convert("RGB")
+    dx, dy = rng.randint(3, 9), rng.randint(3, 9)
+    if im.width > dx + 16 and im.height > dy + 16:
+        im = im.crop((dx, dy, im.width, im.height))
+    im = add_noise(im, NOISE_SIGMA)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()

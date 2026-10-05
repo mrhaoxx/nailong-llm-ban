@@ -48,6 +48,12 @@
   .tag.yes { background: var(--yes-bg); color: var(--yes); }
   .tag.no { background: var(--no-bg); color: var(--no); }
   .tag.bad { background: var(--bad-bg); color: var(--bad); }
+  .chip { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; margin: 2px 4px 0 0;
+          background: var(--panel); border: 1px solid var(--line); white-space: nowrap; }
+  .chip.auto { border-style: dashed; color: var(--muted); }
+  .chip button { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 0 0 4px; font: inherit; }
+  .chip button:hover { color: var(--bad); }
+  .desc { color: var(--text); }
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 8px 10px 10px; }
   .actions button { border: 1px solid var(--line); border-radius: 6px; padding: 6px; cursor: pointer;
                     font: inherit; background: var(--panel); color: var(--text); }
@@ -116,9 +122,18 @@
     </select>
     <button class="pill" id="order"></button>
   </div>
-  <span class="hint" id="hint"><kbd>←</kbd><kbd>→</kbd> 选择　<kbd>Y</kbd> 是奶龙　<kbd>N</kbd> 不是　<kbd>空格</kbd> 放大</span>
+  <span class="hint" id="hint"><kbd>←</kbd><kbd>→</kbd> 选择　<kbd>Y</kbd> 是奶龙　<kbd>N</kbd> 不是　<kbd>T</kbd> 打标签　<kbd>空格</kbd> 放大</span>
 </header>
 
+<form id="searchbar" class="toolbar" style="display:none; padding:12px 16px 0">
+  <input id="q" type="search" placeholder="用文字描述要找的图，例如：穿西装拿枪、在床上、恐怖版" style="flex:1; min-width:200px; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 10px">
+  <button class="btn primary" type="submit">搜索</button>
+  <span class="hint" id="searchInfo" style="margin-left:0"></span>
+</form>
+<div id="tagbar" style="display:none; padding:12px 16px 0">
+  <div class="row" id="tagPills" style="gap:6px; flex-wrap:wrap"></div>
+  <div class="row" id="tagHead" style="margin-top:8px; gap:8px; align-items:center"></div>
+</div>
 <main id="gallery" class="grid"></main>
 
 <section id="retest">
@@ -181,6 +196,8 @@ const VIEWS = [
   ["human/nailong", "人工：是"],
   ["human/not_nailong", "人工：否"],
   ["inconsistent", "不一致"],
+  ["tags", "标签"],
+  ["search", "搜索"],
   ["retest", "重测"],
 ];
 const SCOPE_NAMES = { human: "全部人工", inconsistent: "不一致", "human/nailong": "人工：是", "human/not_nailong": "人工：否",
@@ -221,8 +238,11 @@ async function loadStats() {
 }
 
 function showView() {
-  const isRetest = view === "retest";
+  const isRetest = view === "retest", isSearch = view === "search", isTags = view === "tags";
   $("#gallery").style.display = isRetest ? "none" : "";
+  $("#searchbar").style.display = isSearch ? "flex" : "none";
+  $("#tagbar").style.display = isTags ? "" : "none";
+  $("#sortbar").style.visibility = isRetest || isSearch || isTags ? "hidden" : "";
   $("#retest").classList.toggle("on", isRetest);
   $("#hint").style.visibility = isRetest ? "hidden" : "";
   $("#sort").value = sort;
@@ -256,7 +276,11 @@ function labelTags(it) {
 
 function cardHTML(it, i) {
   const lines = [labelTags(it)];
-  if (it.model && it.model.reason) lines.push(`<span class="reason">${esc(it.model.reason)}</span>`);
+  if (it.desc) lines.push(`<span class="desc">${esc(it.desc)}</span>`);
+  const tagNames = Object.entries(it.tags || {});
+  if (tagNames.length) lines.push(tagNames.map(([n, src]) =>
+    `<span class="chip ${src}" title="${src === "auto" ? "自动推广；去掉后不会再自动加回" : "人工"}">#${esc(n)}<button data-untag="${esc(n)}" title="去掉">×</button></span>`).join(""));
+  if (it.model && it.model.reason) lines.push(esc(it.model.reason));
   lines.push(`加入 ${fmtTime(it.added)} · 最近 ${fmtTime(it.last_seen)} · ${it.count} 次`);
   const src = [it.group_id && `群 ${it.group_id}`, it.user_id && `QQ ${it.user_id}`, it.human && `标注 ${esc(it.human.admin)}`].filter(Boolean).join(" · ");
   if (src) lines.push(esc(src));
@@ -266,6 +290,7 @@ function cardHTML(it, i) {
     <div class="actions">
       <button class="yes${it.human_label === true ? " cur" : ""}" data-label="1">是奶龙</button>
       <button class="no${it.human_label === false ? " cur" : ""}" data-label="0">不是</button>
+      <button data-addtag="1" title="快捷键 t">＋标签</button>
     </div></div>`;
 }
 
@@ -273,13 +298,35 @@ const observer = new IntersectionObserver((es) => { if (es.some((e) => e.isInter
 
 function render() {
   const g = $("#gallery");
-  if (!items.length) { g.innerHTML = `<div class="empty">这一类没有图片</div>`; return; }
+  if (!items.length) {
+    const msg = view === "tags" ? (curTag ? "这个标签下没有图片" : "选择一个标签，或在任意图片上点「＋标签」新建")
+      : view !== "search" ? "这一类没有图片" : lastQuery ? `没有找到和「${esc(lastQuery)}」相关的图` : "输入描述开始搜索";
+    g.innerHTML = `<div class="empty">${msg}</div>`; return;
+  }
   g.innerHTML = items.map(cardHTML).join("") + (items.length < total ? `<div class="empty" id="more">加载中…</div>` : "");
   const more = $("#more"); if (more) observer.observe(more);
 }
 
+let lastQuery = "";
 async function load(reset) {
   if (view === "retest" || loading) return;
+  if (view === "tags") { if (reset) await loadTags(); return; }
+  if (view === "search") {
+    if (!reset) return;
+    items = []; total = 0; sel = 0;
+    if (!lastQuery) return render();
+    loading = true; $("#searchInfo").textContent = "搜索中…"; render();
+    try {
+      const d = await api(`/api/search?${new URLSearchParams({ q: lastQuery })}`);
+      items = d.items; total = d.total;
+      const u = d.usage;
+      const cost = u.cached == null ? `输入 ${u.prompt}` : `输入 ${u.prompt} = 缓存 ${u.cached} + 新 ${u.prompt - u.cached}`;
+      $("#searchInfo").textContent = `图库 ${d.gallery} 张，找到 ${d.total} 张 · ${cost} · 输出 ${u.completion} · ${u.seconds}s`;
+      render();
+    } catch (e) { if (e.message !== "401") { $("#searchInfo").textContent = ""; toast("搜索失败：" + e.message); } }
+    finally { loading = false; }
+    return;
+  }
   loading = true;
   try {
     if (reset) { items = []; sel = 0; window.scrollTo(0, 0); }
@@ -300,6 +347,7 @@ function select(i) {
 }
 
 function stillBelongs(it, yes) {
+  if (view === "search" || view === "tags") return true;
   if (view.startsWith("model/")) return false;
   if (view === "inconsistent") return it.model_decision !== yes;
   return view === `human/${yes ? "nailong" : "not_nailong"}`;
@@ -334,6 +382,9 @@ $("#gallery").addEventListener("click", (e) => {
   const i = +card.dataset.i;
   const btn = e.target.closest("button[data-label]");
   if (btn) { select(i); label(i, btn.dataset.label === "1"); return; }
+  const un = e.target.closest("button[data-untag]");
+  if (un) { select(i); untag(i, un.dataset.untag); return; }
+  if (e.target.closest("button[data-addtag]")) { select(i); addTag(i); return; }
   select(i);
   if (e.target.closest(".thumb")) zoom(items[i].url);
 });
@@ -357,11 +408,83 @@ document.addEventListener("keydown", (e) => {
     case "ArrowUp": case "k": select(sel - cols); break;
     case "y": case "Y": case "1": $("#lightbox").classList.remove("on"); label(sel, true); break;
     case "n": case "N": case "2": $("#lightbox").classList.remove("on"); label(sel, false); break;
+    case "t": case "T": $("#lightbox").classList.remove("on"); addTag(sel); break;
     case " ": lb ? $("#lightbox").classList.remove("on") : zoom(items[sel]?.url); break;
     case "Escape": $("#lightbox").classList.remove("on"); break;
     default: return;
   }
   e.preventDefault();
+});
+
+/* ---------- 标签 ---------- */
+let curTag = store("curTag") || "", tagList = [];
+const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+async function addTag(i) {
+  const it = items[i]; if (!it) return;
+  const input = prompt("标签名，可以空一格再写说明（只在新建标签或想改说明时写）\n例如：老八 穿西装拿枪的黑帮奶龙", store("lastTag") || "");
+  if (!input || !input.trim()) return;
+  const [name, ...rest] = input.trim().split(/\s+/);
+  try {
+    const r = await post("/api/tag", { sha: it.sha, tag: name, note: rest.join(" ") || null });
+    store("lastTag", name); it.tags = r.tags; render(); select(i);
+    toast(`已打上「${name}」，查看这个标签时会自动找出同类的图`);
+  } catch (e) { if (e.message !== "401") toast("打标签失败：" + e.message); }
+}
+
+async function untag(i, name) {
+  const it = items[i]; if (!it) return;
+  try {
+    const r = await post("/api/untag", { sha: it.sha, tag: name });
+    toast(`已去掉「${name}」，以后不会再自动加上`);
+    if (view === "tags" && name === curTag) { items.splice(i, 1); total -= 1; }
+    else it.tags = r.tags;
+    render(); select(Math.min(i, items.length - 1));
+  } catch (e) { if (e.message !== "401") toast("去掉失败：" + e.message); }
+}
+
+function renderTagPills() {
+  $("#tagPills").innerHTML = tagList.length ? tagList.map((t) =>
+    `<button class="pill ${t.name === curTag ? "active" : ""}" data-tag="${esc(t.name)}" title="${esc(t.note)}">#${esc(t.name)}
+      <span class="n">${t.human}${t.stale ? " · 待更新" : ` + ${t.auto}`}</span></button>`).join("")
+    : `<span class="hint" style="margin:0">还没有标签。在任意图片上点「＋标签」（或按 t）新建</span>`;
+}
+
+async function loadTags() {
+  try { tagList = await api("/api/tags"); } catch (e) { if (e.message !== "401") toast("读取标签失败：" + e.message); return; }
+  if (curTag && !tagList.some((t) => t.name === curTag)) curTag = "";
+  renderTagPills();
+  items = []; total = 0; sel = 0; $("#tagHead").innerHTML = "";
+  if (!curTag) return render();
+  const t = tagList.find((x) => x.name === curTag);
+  loading = true; render();
+  $("#tagHead").innerHTML = `<span class="hint" style="margin:0">${t.stale ? "正在推广到同类的图…" : "加载中…"}</span>`;
+  try {
+    const d = await api(`/api/tagged?${new URLSearchParams({ tag: curTag })}`);
+    items = d.items; total = d.total;
+    const u = d.usage;
+    const cost = u ? ` · 本次推广 输入 ${u.prompt}${u.cached == null ? "" : ` = 缓存 ${u.cached} + 新 ${u.prompt - u.cached}`} · 输出 ${u.completion} · ${u.seconds}s` : "";
+    const human = items.filter((x) => (x.tags || {})[curTag] === "human").length;
+    $("#tagHead").innerHTML = `<b>#${esc(curTag)}</b><span>${esc(d.note) || '<span class="hint" style="margin:0">无说明</span>'}</span>
+      <button class="btn" id="tagNote">改说明</button><button class="btn" id="tagDel">删除标签</button>
+      <span class="hint" style="margin:0">人工 ${human} · 自动 ${items.length - human}${cost}</span>`;
+    $("#tagNote").onclick = async () => {
+      const note = prompt(`「${curTag}」的说明（推广时模型会参考）`, d.note); if (note == null) return;
+      try { await post("/api/tagnote", { tag: curTag, note }); toast("已更新说明"); loadTags(); } catch (e) { toast("失败：" + e.message); }
+    };
+    $("#tagDel").onclick = async () => {
+      if (!confirm(`删除标签「${curTag}」？所有图上的这个标签都会去掉`)) return;
+      try { await post("/api/tagdelete", { tag: curTag }); toast("已删除"); curTag = ""; store("curTag", ""); loadTags(); } catch (e) { toast("失败：" + e.message); }
+    };
+    // 推广后数量变了，刷新标签栏
+    if (t.stale) { tagList = await api("/api/tags").catch(() => tagList); renderTagPills(); }
+  } catch (e) { if (e.message !== "401") { $("#tagHead").innerHTML = ""; toast(e.message); } }
+  finally { loading = false; render(); }
+}
+
+$("#tagPills").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-tag]"); if (!b) return;
+  curTag = b.dataset.tag === curTag ? "" : b.dataset.tag; store("curTag", curTag); loadTags();
 });
 
 /* ---------- 重测 ---------- */
@@ -497,6 +620,10 @@ function renderResults() {
     : `<div class="empty">没有符合条件的图片</div>`;
 }
 $("#detail").addEventListener("click", (e) => { const img = e.target.closest("img[data-zoom]"); if (img) zoom(img.dataset.zoom); });
+
+$("#searchbar").addEventListener("submit", (e) => {
+  e.preventDefault(); lastQuery = $("#q").value.trim(); load(true);
+});
 
 loadStats().then(showView).catch(() => {});
 </script>

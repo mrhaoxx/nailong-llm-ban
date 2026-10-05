@@ -44,8 +44,8 @@ examples:
   rebuild_seconds: 60       # 人工标注变化后最快多久重选例子；连续标注时合并成一次，减少缓存失效
 
 # 指令权限。级别：admin（上面的 admins）、group_admin（群主/群管理员）、member（所有人）。
-# 默认只有 admin 能用；只读指令（help/test/stats/wall/status/examples）最多开放到 member，
-# 会改数据的（examples-set/forget/rewind/label）最多开放到 group_admin。群里用 /perm 调整的优先于这里。
+# 默认只有 admin 能用；只读指令（help/test/stats/wall/status/examples/search/similar/explain/tags）最多开放到 member，
+# 会改数据的（examples-set/forget/rewind/label/tag/untag）最多开放到 group_admin。群里用 /perm 调整的优先于这里。
 permissions:
   groups: {}
   #  123456789: {test: member, stats: member, wall: member, help: member, rewind: group_admin}

@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import detector as detector_mod
 from .cache import VerdictCache
+from .gallery import Gallery
 from .config import Config, load_config
 from .detector import Detector
 from .examples import COUNTS_SETTING, examples_limit
@@ -202,6 +203,7 @@ class App:
         self.index = ManifestIndex(self.store.manifest)
         self.lock = threading.Lock()
         self.retester = Retester(cfg, self.store, self.root / "retests")
+        self.gallery = Gallery(self.cache, self.store)
 
     def example_counts(self) -> tuple[int, int]:
         """线上机器人使用的例子数量：/examples 设置过的值优先，否则用 config。"""
@@ -217,8 +219,11 @@ class App:
         return bool(rec["label"]) and (rec.get("confidence") if rec.get("confidence") is not None else 1.0) >= self.cfg.threshold
 
     def entries(self, view: str) -> list[dict[str, Any]]:
-        dirs = {"inconsistent": DIRS[2:], "human": DIRS[2:]}.get(view, [view])
+        dirs = {"inconsistent": DIRS[2:], "human": DIRS[2:], "all": DIRS,
+                "nailong": ["model/nailong", "human/nailong"]}.get(view, [view])
         sightings = self.cache.sightings()
+        tags = self.cache.all_image_tags()
+        captions = dict(self.cache.captions())
         with self.lock:
             self.index.refresh()
             out = []
@@ -249,6 +254,8 @@ class App:
                         "count": s.count if s else 0,
                         "group_id": m.get("group_id") or (h or {}).get("group_id"),
                         "user_id": m.get("user_id") or (h or {}).get("user_id"),
+                        "tags": tags.get(sha, {}),
+                        "desc": captions.get(sha, ""),
                     })
         return out
 
@@ -275,6 +282,55 @@ class App:
     def list_images(self, view: str, sort: str, order: str, offset: int, limit: int) -> dict[str, Any]:
         entries = self.sort(self.entries(view), sort, order)
         return {"total": len(entries), "items": [self.public(e) for e in entries[offset : offset + limit]]}
+
+    def search(self, query: str, limit: int) -> dict[str, Any]:
+        """和群里 /search 一样：模型直接看图库拼图找图（与机器人共用同一套拼图，前缀缓存互通）。"""
+        future = asyncio.run_coroutine_threadsafe(
+            self.gallery.search(self.retester.detector, query, limit), self.retester.loop)
+        result = future.result(timeout=180)
+        entries = {e["sha"]: e for e in self.entries("all")}
+        items = [self.public(entries[sha]) for sha in result.shas if sha in entries]
+        u = result.usage
+        return {"total": len(items), "items": items, "gallery": len(self.gallery.entries()),
+                "usage": {"prompt": u.prompt, "cached": u.cached, "completion": u.completion, "seconds": round(u.seconds, 1)}}
+
+    # ---------- 标签 ----------
+
+    def tag_list(self) -> list[dict[str, Any]]:
+        stale = set(self.gallery.stale())
+        return [{**t, "stale": t["name"] in stale} for t in self.cache.tags()]
+
+    def add_tag(self, sha: str, name: str, note: str | None) -> bool:
+        """和群里 /tag 一样只写数据库；不是奶龙的图打标签后进图库，在后台补写描述。"""
+        path = self.store.find(sha)
+        if path is None:
+            return False
+        self.cache.upsert_tag(name, note)
+        self.cache.set_image_tag(sha, name, "human")
+        log.info("网页给 %s 打上标签「%s」", sha[:12], name)
+        if sha not in dict(self.cache.captions()):
+            asyncio.run_coroutine_threadsafe(self._caption(sha, path), self.retester.loop)
+        return True
+
+    async def _caption(self, sha: str, path: Path) -> None:
+        try:
+            uri = await asyncio.to_thread(to_data_uri, path.read_bytes(), self.cfg.frames)
+            if text := await self.retester.detector.describe(uri):
+                self.cache.set_caption(sha, text)
+        except Exception as e:
+            log.warning("补写描述失败 %s: %s", sha[:12], e)
+
+    def tagged(self, name: str) -> dict[str, Any]:
+        """某标签下的图。标签过期时先推广一次（一次模型调用），返回用量。"""
+        future = asyncio.run_coroutine_threadsafe(self.gallery.refresh(self.retester.detector, [name]), self.retester.loop)
+        usage = future.result(timeout=300)
+        entries = {e["sha"]: e for e in self.entries("all")}
+        items = [self.public(entries[sha]) for sha, _ in self.cache.tagged(name) if sha in entries]
+        out: dict[str, Any] = {"total": len(items), "items": items, "note": self.cache.tag_note(name) or ""}
+        if usage:
+            out["usage"] = {"prompt": usage.prompt, "cached": usage.cached, "completion": usage.completion,
+                            "seconds": round(usage.seconds, 1)}
+        return out
 
     def locate(self) -> dict[str, str]:
         return {f.stem: f"/img/{d}/{f.name}" for d in DIRS for f in (self.root / d).iterdir() if f.is_file()}
@@ -367,6 +423,19 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 except ValueError:
                     return self._json({"error": "参数错误"}, 400)
                 self._json(app.list_images(view, sort, order, offset, limit))
+            elif path == "/api/search":
+                text = q("q").strip()
+                if not text:
+                    return self._json({"error": "参数错误"}, 400)
+                try:
+                    limit = max(1, min(int(q("limit", "30")), 60))
+                except ValueError:
+                    return self._json({"error": "参数错误"}, 400)
+                try:
+                    self._json(app.search(text, limit))
+                except Exception as e:
+                    log.warning("搜索失败: %s", e)
+                    self._json({"error": f"搜索失败：{e}"[:200]}, 502)
             elif path == "/api/prompt":
                 self._json({
                     "prompt": detector_mod.SYSTEM_PROMPT,
@@ -385,6 +454,17 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 for r in job["results"] + job.get("examples", []):
                     r["url"] = urls.get(r["sha"])
                 self._json(job)
+            elif path == "/api/tags":
+                self._json(app.tag_list())
+            elif path == "/api/tagged":
+                name = q("tag").strip()
+                if app.cache.tag_note(name) is None:
+                    return self._json({"error": "没有这个标签"}, 404)
+                try:
+                    self._json(app.tagged(name))
+                except Exception as e:
+                    log.warning("标签推广失败: %s", e)
+                    self._json({"error": f"标签推广失败：{e}"[:200]}, 502)
             elif path.startswith("/img/"):
                 target = (app.root / unquote(path[len("/img/") :])).resolve()
                 if not target.is_relative_to(app.root) or target.parent.relative_to(app.root).as_posix() not in DIRS or not target.is_file():
@@ -412,6 +492,28 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                     return self._json({"error": "图片不存在"}, 404)
                 log.info("网页标注 %s -> %s", sha[:12], category)
                 self._json({"ok": True, "category": category})
+            elif path in ("/api/tag", "/api/untag", "/api/tagnote", "/api/tagdelete"):
+                sha, name, note = body.get("sha"), body.get("tag"), body.get("note")
+                name = name.strip() if isinstance(name, str) else ""
+                if not name or len(name) > 30 or any(c.isspace() for c in name) or (note is not None and not isinstance(note, str)):
+                    return self._json({"error": "标签名不能为空、不能有空格、最多 30 字"}, 400)
+                if path in ("/api/tag", "/api/untag") and (not isinstance(sha, str) or not _SHA_RE.match(sha)):
+                    return self._json({"error": "参数错误"}, 400)
+                if path == "/api/tag":
+                    if not app.add_tag(sha, name, note.strip() if note and note.strip() else None):
+                        return self._json({"error": "图片不存在"}, 404)
+                elif app.cache.tag_note(name) is None:
+                    return self._json({"error": "没有这个标签"}, 404)
+                elif path == "/api/untag":
+                    # 记成 rejected：以后推广时也不会再自动加回来
+                    app.cache.set_image_tag(sha, name, "rejected")
+                elif path == "/api/tagnote":
+                    app.cache.upsert_tag(name, (note or "").strip())
+                else:
+                    app.cache.delete_tag(name)
+                    app.cache.set_setting(f"tagsig.{name}", None)
+                    log.info("网页删除标签「%s」", name)
+                self._json({"ok": True, "tags": app.cache.image_tags(sha) if isinstance(sha, str) else None})
             elif path == "/api/retest":
                 prompt, scope = body.get("prompt"), body.get("scope")
                 sort, order, limit = body.get("sort", "added"), body.get("order", "desc"), body.get("limit", 100)

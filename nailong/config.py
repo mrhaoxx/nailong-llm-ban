@@ -101,6 +101,8 @@ class Config:
     cache_path: str = "nailong_cache.sqlite3"
     # 样本集目录；为空则不保存
     save_dir: str = "nailong_images"
+    # 送给模型前对图片做随机平移并加微噪声，破坏针对视觉编码器优化的对抗扰动
+    harden_images: bool = True
     # 单张图片下载上限；奶龙动图常常超过 10MB
     max_image_bytes: int = 50 * 1024 * 1024
     log_level: str = "INFO"

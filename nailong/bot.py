@@ -14,6 +14,7 @@ from .cache import Action, VerdictCache
 from .config import Config, load_config
 from .detector import Detector, ImageRef, Usage
 from .examples import TOKENS_PER_IMAGE
+from .gallery import Gallery, SearchResult
 from .image import BADGE_NO, BADGE_YES, make_collage, mface_url, sha256, to_data_uri
 from .labeling import apply_human_label
 from .onebot import OneBot, OneBotError
@@ -40,6 +41,19 @@ _STATS_RE = re.compile(r"^[/#]stats(?:\s+(.+))?$", re.IGNORECASE)
 _HELP_RE = re.compile(r"^[/#](help|帮助)$", re.IGNORECASE)
 _WALL_RE = re.compile(r"^[/#]wall(?:\s+(.+))?$", re.IGNORECASE)
 # /perm [指令 级别]：查看或设置本群指令权限（仅 config 管理员）
+# /search 描述：按文字描述搜奶龙图
+_SEARCH_RE = re.compile(r"^[/#](?:search|搜索|搜图)\s+(.+)$", re.IGNORECASE)
+_SIMILAR_RE = re.compile(r"^[/#](?:similar|相似|以图搜图)$", re.IGNORECASE)
+_EXPLAIN_RE = re.compile(r"^[/#](?:explain|解释)$", re.IGNORECASE)
+# /tags [标签]；/tag 标签 [说明]；/untag 标签
+_TAGS_RE = re.compile(r"^[/#]tags(?:\s+(\S+))?$", re.IGNORECASE)
+_TAG_RE = re.compile(r"^[/#]tag\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE | re.DOTALL)
+_UNTAG_RE = re.compile(r"^[/#]untag\s+(\S+)$", re.IGNORECASE)
+TAG_SHOW_MAX = 25
+SEARCH_LIMIT = 9
+SEARCH_TIMEOUT = 300
+SEARCH_MAX_SEND = 3
+SEARCH_MAX_BYTES = 20 * 1024 * 1024
 _PERM_RE = re.compile(r"^[/#]perm(?:\s+(\S+)(?:\s+(\S+))?)?$", re.IGNORECASE)
 TEST_MAX_IMAGES = 4
 REPORT_SECONDS = 120
@@ -50,6 +64,14 @@ REWIND_DEFAULT = 9
 REWIND_MAX = 25
 REWIND_TIMEOUT = 120
 REWIND_LINGER = 5
+
+
+@dataclass
+class SearchSession:
+    """/search 之后的编号回复：编号 -> sha。"""
+
+    items: dict[int, str]
+    expires: float
 
 
 @dataclass
@@ -67,11 +89,14 @@ class NailongBot:
         self.cfg = cfg
         self.cache = VerdictCache(cfg.cache_path)
         self.store = SampleStore(cfg.save_dir) if cfg.save_dir else None
+        self.gallery = Gallery(self.cache, self.store) if self.store else None
         self.detector = Detector(cfg, self.cache, self.store)
         self.onebot = OneBot(cfg.onebot, self.on_event)
         self.rewinds: dict[tuple[int, int], RewindSession] = {}
+        self.searches: dict[tuple[int, int], SearchSession] = {}
         self.perms = Permissions(cfg, self.cache)
         self._wall_lock = asyncio.Lock()
+        self._captioning = False
         self._tasks: set[asyncio.Task[None]] = set()
         if not cfg.groups:
             log.warning("未配置 groups，不会处理任何群消息")
@@ -79,6 +104,7 @@ class NailongBot:
     async def run(self) -> None:
         if self.store is not None:
             self._spawn(asyncio.to_thread(self._backfill_thumbs))
+            self._spawn(self._backfill_captions())
         try:
             await self.onebot.run()
         finally:
@@ -191,23 +217,39 @@ class NailongBot:
                 await self.punish(event["group_id"], target_user, int(reply_id), target_refs)
 
     async def reply(self, event: dict[str, Any], text: str, extra: list[dict[str, Any]] | None = None) -> int | None:
-        """回复一条消息，返回机器人这条消息的 id（发送失败为 None）。"""
+        """回复一条消息，返回机器人这条消息的 id（发送失败为 None）。
+
+        带图片的消息发送失败时，去掉文字只发图片再试一次：模型生成的文字（理由、描述）可能碰到 QQ 的敏感词，
+        整条消息会被服务器拦下（NapCat 报 sendMsg Timeout），这样至少图片能送到。
+        """
+        has_image = bool(extra) and any(seg.get("type") == "image" for seg in extra)
+        try:
+            return await self._send(event, text, extra, has_image)
+        except OneBotError as e:
+            log.warning("回复失败: %s", e)
+            if not has_image or not text:
+                return None
+        try:
+            mid = await self._send(event, "（文字内容未能发出）", extra, has_image)
+            log.info("去掉文字后重发成功")
+            return mid
+        except OneBotError as e:
+            log.warning("去掉文字后重发仍失败: %s", e)
+            return None
+
+    async def _send(self, event: dict[str, Any], text: str, extra: list[dict[str, Any]] | None, has_image: bool) -> int | None:
         message = [
             {"type": "reply", "data": {"id": str(event["message_id"])}},
             *(extra or []),
-            {"type": "text", "data": {"text": text}},
+            *([{"type": "text", "data": {"text": text}}] if text else []),
         ]
         # 带图片的消息（拼图、统计卡片、奶龙墙）上传慢，多等一会儿
-        timeout = SEND_IMAGE_TIMEOUT if extra and any(seg.get("type") == "image" for seg in extra) else None
-        try:
-            if event.get("message_type") == "group":
-                data = await self.onebot.call("send_group_msg", timeout, group_id=event["group_id"], message=message)
-            else:
-                data = await self.onebot.call("send_private_msg", timeout, user_id=event["user_id"], message=message)
-            return (data or {}).get("message_id")
-        except OneBotError as e:
-            log.warning("回复失败: %s", e)
-            return None
+        timeout = SEND_IMAGE_TIMEOUT if has_image else None
+        if event.get("message_type") == "group":
+            data = await self.onebot.call("send_group_msg", timeout, group_id=event["group_id"], message=message)
+        else:
+            data = await self.onebot.call("send_private_msg", timeout, user_id=event["user_id"], message=message)
+        return (data or {}).get("message_id")
 
     async def punish(self, group_id: int, user_id: int, message_id: int, refs: list[ImageRef] | None = None) -> None:
         act = self.cfg.action
@@ -251,6 +293,10 @@ class NailongBot:
                             ("wall", _WALL_RE), ("status", _STATUS_RE)):
             if m := regex.match(text):
                 return name, m
+        for name, regex in (("search", _SEARCH_RE), ("similar", _SIMILAR_RE), ("explain", _EXPLAIN_RE),
+                            ("tags", _TAGS_RE), ("tag", _TAG_RE), ("untag", _UNTAG_RE)):
+            if m := regex.match(text):
+                return name, m
         if in_group and (m := _PERM_RE.match(text)):
             return "perm", m
         if in_group and (m := _EXAMPLES_RE.match(text)):
@@ -269,6 +315,13 @@ class NailongBot:
             if session and (text == "取消" or _IDS_RE.match(text)):
                 await self.answer_rewind(session, event, text)
                 return True
+        text = plain_text(event.get("message"))
+        search = self.searches.get(_chat_key(event))
+        if search and _IDS_RE.match(text):
+            if time.monotonic() < search.expires:
+                await self.answer_search(search, event, text)
+                return True
+            del self.searches[_chat_key(event)]
         found = self.identify(event)
         if found is None:
             return False
@@ -307,6 +360,18 @@ class NailongBot:
         elif name == "rewind":
             count = min(max(int(m.group(1) or REWIND_DEFAULT), 1), REWIND_MAX)
             await self.start_rewind(event, count)
+        elif name == "search":
+            await self.search_command(event, m.group(1).strip())
+        elif name == "similar":
+            await self.similar_command(event)
+        elif name == "explain":
+            await self.explain_command(event)
+        elif name == "tags":
+            await self.tags_command(event, m.group(1))
+        elif name == "tag":
+            await self.tag_command(event, m.group(1), (m.group(2) or "").strip() or None)
+        elif name == "untag":
+            await self.untag_command(event, m.group(1))
         elif name == "label":
             await self.handle_label(event, parse_command(event.get("message")))
         return True
@@ -322,6 +387,208 @@ class NailongBot:
         if any(self.perms.allowed(event, n) for n in ("stats", "wall")):
             lines.append("时间范围：today（默认）、yesterday、all、30m、3h、7d、2w、1y、09-01、09-01~09-15")
         return "\n".join(lines)
+
+    # ---------- /search ----------
+
+    async def search_command(self, event: dict[str, Any], query: str) -> None:
+        if self.gallery is None:
+            return await self.say(event, "未开启样本保存（save_dir），无法搜索", REPORT_SECONDS)
+        try:
+            result = await self.gallery.search(self.detector, query, SEARCH_LIMIT)
+        except RuntimeError as e:
+            log.warning("搜索失败: %s", e)
+            return await self.say(event, f"搜索失败：{e}"[:200], REPORT_SECONDS)
+        await self.show_results(event, f"搜索「{query}」", result, "search")
+
+    async def similar_command(self, event: dict[str, Any]) -> None:
+        if self.gallery is None:
+            return await self.say(event, "未开启样本保存（save_dir），无法搜索", REPORT_SECONDS)
+        refs, _, _ = await self.collect_images(event)
+        if not refs:
+            return await self.say(event, "用法：发送 /similar 并附上图片，或回复一条带图消息发送 /similar", REPORT_SECONDS)
+        got = await self._image_of(refs[0])
+        if got is None:
+            return await self.say(event, "图片下载或解析失败", REPORT_SECONDS)
+        sha, uri = got
+        try:
+            result = await self.gallery.similar(self.detector, sha, uri, SEARCH_LIMIT)
+        except RuntimeError as e:
+            log.warning("以图搜图失败: %s", e)
+            return await self.say(event, f"以图搜图失败：{e}"[:200], REPORT_SECONDS)
+        await self.show_results(event, "相似的图", result, "similar")
+
+    async def show_results(self, event: dict[str, Any], title: str, result: SearchResult | list[str],
+                           name: str, usage: Usage | None = None) -> None:
+        """发编号拼图，之后回复编号取原图。附上这次模型调用的 token 用量。"""
+        shas = result.shas if isinstance(result, SearchResult) else result
+        usage = result.usage if isinstance(result, SearchResult) else usage
+        cost = f"\n{format_usage(usage)} · {usage.seconds:.1f}s" if usage else ""
+        if not shas:
+            return await self.say(event, f"{title}：没有找到{cost}", REPORT_SECONDS)
+        tiles = []
+        for i, sha in enumerate(shas, 1):
+            path = self.store.find(sha)
+            if path is None:
+                continue
+            thumb = await asyncio.to_thread(make_thumb, path, self.store.root / "thumbs")
+            tiles.append((str(i), await asyncio.to_thread(thumb.read_bytes)))
+        collage = await asyncio.to_thread(make_collage, tiles)
+        image = {"type": "image", "data": {"file": "base64://" + base64.b64encode(collage).decode()}}
+        text = (f"{title}：{len(shas)} 张，回复编号获取原图（如 1 或 2 5），{SEARCH_TIMEOUT // 60} 分钟内有效{cost}")
+        now = time.monotonic()
+        self.searches = {k: v for k, v in self.searches.items() if v.expires > now}
+        self.searches[_chat_key(event)] = SearchSession(dict(enumerate(shas, 1)), now + SEARCH_TIMEOUT)
+        await self.say(event, text, self.perms.recall_seconds(name), [image])
+
+    async def _image_of(self, ref: ImageRef, save: bool = False) -> tuple[str, str] | None:
+        """(sha, 送模型用的 data URI)。save=True 时确保图片存进样本集（打标签的图要能进图库）。"""
+        data = await self.detector.download(ref)
+        if data is None:
+            return None
+        sha = sha256(data)
+        try:
+            uri = await asyncio.to_thread(to_data_uri, data, self.cfg.frames)
+        except Exception as e:
+            log.warning("图片无法解析: %s", e)
+            return None
+        if save and self.store is not None and self.store.find(sha) is None:
+            verdict = self.cache.lookup(*ref.keys, "sha256:" + sha, sha=sha)
+            await asyncio.to_thread(self.store.save, data, sha, bool(verdict and verdict.is_nailong), "model",
+                                    {"keys": ref.keys, "via": "tag"})
+        return sha, uri
+
+    # ---------- 标签 ----------
+
+    async def tag_command(self, event: dict[str, Any], name: str, note: str | None) -> None:
+        """只写数据库，不调用模型、不动图库拼图；推广等到有人查看时再做。"""
+        if self.gallery is None:
+            return await self.say(event, "未开启样本保存（save_dir），无法打标签", REPORT_SECONDS)
+        refs, _, _ = await self.collect_images(event)
+        if not refs:
+            if note is None:
+                return await self.say(event, "用法：/tag 标签 [说明] 并附上图片或回复带图消息；不带图时用来修改说明", REPORT_SECONDS)
+            created = self.cache.upsert_tag(name, note)
+            return await self.say(event, f"已{'新建' if created else '更新'}标签「{name}」的说明", REPORT_SECONDS)
+        shas = []
+        for ref in refs:
+            got = await self._image_of(ref, save=True)
+            if got:
+                shas.append(got[0])
+        if not shas:
+            return await self.say(event, "图片下载或解析失败", REPORT_SECONDS)
+        created = self.cache.upsert_tag(name, note)
+        for sha in shas:
+            self.cache.set_image_tag(sha, name, "human")
+        log.info("%s 给 %d 张图打上标签「%s」", event.get("user_id"), len(shas), name)
+        self._spawn(self._backfill_captions())   # 不是奶龙的图打标签后才进图库，补上描述
+        tip = "，新标签" if created else ""
+        if created and not note:
+            tip += "（可以用 /tag 标签 说明 补一句说明，推广会更准）"
+        await self.say(event, f"已给 {len(shas)} 张图打上「{name}」{tip}。用 /tags {name} 查看时会自动找出同类的图",
+                       REPORT_SECONDS)
+
+    async def untag_command(self, event: dict[str, Any], name: str) -> None:
+        if self.cache.tag_note(name) is None:
+            return await self.say(event, f"没有标签「{name}」", REPORT_SECONDS)
+        refs, _, _ = await self.collect_images(event)
+        if not refs:
+            if self.perms.level_of(event) != "admin":
+                return await self.say(event, "删除整个标签仅限管理员；去掉某张图的标签请附上图片", REPORT_SECONDS)
+            self.cache.delete_tag(name)
+            self.cache.set_setting(f"tagsig.{name}", None)
+            return await self.say(event, f"已删除标签「{name}」", REPORT_SECONDS)
+        count = 0
+        for ref in refs:
+            got = await self._image_of(ref)
+            if got:
+                # 记成 rejected：以后推广时也不会再自动加回来
+                self.cache.set_image_tag(got[0], name, "rejected")
+                count += 1
+        await self.say(event, f"已去掉 {count} 张图的「{name}」，以后也不会再自动加上", REPORT_SECONDS)
+
+    async def tags_command(self, event: dict[str, Any], name: str | None) -> None:
+        if self.gallery is None:
+            return await self.say(event, "未开启样本保存（save_dir）", REPORT_SECONDS)
+        if name is None:
+            tags = self.cache.tags()
+            if not tags:
+                return await self.say(event, "还没有标签。用 /tag 标签 [说明] 给图片打标签", REPORT_SECONDS)
+            stale = set(await asyncio.to_thread(self.gallery.stale))
+            lines = [f"标签 {len(tags)} 个（/tags 标签 查看图片）"]
+            for t in tags:
+                auto = "待更新" if t["name"] in stale else f"自动 {t['auto']}"
+                note = f"：{t['note']}" if t["note"] else ""
+                lines.append(f"「{t['name']}」人工 {t['human']} · {auto}{note}")
+            return await self.say(event, "\n".join(lines), self.perms.recall_seconds("tags"))
+        if self.cache.tag_note(name) is None:
+            return await self.say(event, f"没有标签「{name}」", REPORT_SECONDS)
+        try:
+            usage = await self.gallery.refresh(self.detector, [name])
+        except RuntimeError as e:
+            log.warning("标签推广失败: %s", e)
+            usage = None
+            await self.say(event, f"自动推广失败，只显示已有结果：{e}"[:200], COOLDOWN_NOTICE_SECONDS)
+        rows = self.cache.tagged(name)
+        shas = [sha for sha, _ in rows if self.store.find(sha)][:TAG_SHOW_MAX]
+        human = sum(1 for _, src in rows if src == "human")
+        title = f"「{name}」人工 {human} · 自动 {len(rows) - human}" + (f"（显示前 {TAG_SHOW_MAX}）" if len(rows) > TAG_SHOW_MAX else "")
+        await self.show_results(event, title, shas, "tags", usage)
+
+    async def explain_command(self, event: dict[str, Any]) -> None:
+        if self.gallery is None:
+            return await self.say(event, "未开启样本保存（save_dir）", REPORT_SECONDS)
+        refs, _, _ = await self.collect_images(event)
+        if not refs:
+            return await self.say(event, "用法：发送 /explain 并附上图片，或回复一条带图消息发送 /explain", REPORT_SECONDS)
+        tags = {t["name"]: t["note"] for t in self.cache.tags()}
+        if not tags:
+            return await self.say(event, "还没有标签。用 /tag 标签 说明 给图片打标签后再用 /explain", REPORT_SECONDS)
+        got = await self._image_of(refs[0])
+        if got is None:
+            return await self.say(event, "图片下载或解析失败", REPORT_SECONDS)
+        sha, uri = got
+        try:
+            await asyncio.to_thread(self.gallery.sync)
+            if sha in self.gallery.id_of():
+                usage = await self.gallery.refresh(self.detector)
+                found = self.cache.image_tags(sha)
+            else:
+                names, usage = await self.gallery.classify_tags(self.detector, uri)
+                found = {n: "auto" for n in names}
+        except RuntimeError as e:
+            log.warning("解释失败: %s", e)
+            return await self.say(event, f"解释失败：{e}"[:200], REPORT_SECONDS)
+        if found:
+            lines = [f"「{n}」{'' if src == 'human' else '（自动）'}" + (f"：{tags[n]}" if tags.get(n) else "")
+                     for n, src in found.items() if n in tags]
+        else:
+            lines = ["没有匹配的标签"]
+        if usage:
+            lines.append(f"{format_usage(usage)} · {usage.seconds:.1f}s")
+        await self.say(event, "\n".join(lines), self.perms.recall_seconds("explain"))
+
+    async def answer_search(self, session: SearchSession, event: dict[str, Any], text: str) -> None:
+        ids = [int(x) for x in re.findall(r"\d+", text)]
+        picked = [i for i in dict.fromkeys(ids) if i in session.items][:SEARCH_MAX_SEND]
+        if not picked:
+            return await self.say(event, f"没有这个编号，可选 1-{max(session.items)}", COOLDOWN_NOTICE_SECONDS)
+        segments, notes = [], []
+        for i in picked:
+            path = self.store.find(session.items[i]) if self.store else None
+            if path is None:
+                notes.append(f"#{i} 已不存在")
+                continue
+            data = await asyncio.to_thread(path.read_bytes)
+            if len(data) > SEARCH_MAX_BYTES:
+                # 原图太大发不出去，退而发小图
+                thumb = await asyncio.to_thread(make_thumb, path, self.store.root / "thumbs")
+                data = await asyncio.to_thread(thumb.read_bytes)
+                notes.append(f"#{i} 原图太大，发的是缩小版")
+            segments.append({"type": "image", "data": {"file": "base64://" + base64.b64encode(data).decode()}})
+        if segments:
+            await self.reply(event, "，".join(notes) or f"#{' #'.join(map(str, picked))}", segments)
+        elif notes:
+            await self.say(event, "，".join(notes), COOLDOWN_NOTICE_SECONDS)
 
     # ---------- /perm ----------
 
@@ -517,7 +784,7 @@ class NailongBot:
                 ago = int(time.time() - ex.updated_at)
                 lines.append(f"例子上次变化：{ago // 60} 分 {ago % 60} 秒前（标注变化后最快 {self.cfg.examples.rebuild_seconds:g} 秒内生效）")
             # 前缀 = 系统提示 + 例子；带同样数量例子的调用里命中缓存的部分就是已缓存的前缀
-            same = [u for u in d.usage if u.examples == len(current) and u.cached is not None]
+            same = [u for u in d.usage if u.kind in ("detect", "test") and u.examples == len(current) and u.cached is not None]
             if same:
                 lines.append(f"前缀（系统提示 + {len(current)} 张例子）：已缓存约 {max(u.cached for u in same)} token")
             else:
@@ -529,8 +796,10 @@ class NailongBot:
         if recent:
             lines.append(f"最近 {len(recent)} 次调用（输入 = 缓存 + 新）：")
             for u in reversed(recent):
-                kind = {"detect": "检测", "test": "测试"}.get(u.kind, u.kind)
-                lines.append(f"{time.strftime('%H:%M:%S', time.localtime(u.time))} {kind} 例子{u.examples} · "
+                kind = {"detect": "检测", "test": "测试", "search": "搜图", "similar": "以图搜图", "tags": "标签推广",
+                        "explain": "解释"}.get(u.kind, u.kind)
+                shots = f" 例子{u.examples}" if u.kind in ("detect", "test") else ""
+                lines.append(f"{time.strftime('%H:%M:%S', time.localtime(u.time))} {kind}{shots} · "
                              f"{format_usage(u)} · {u.seconds:.1f}s")
         else:
             lines.append("启动以来还没有调用过模型")
@@ -684,6 +953,31 @@ class NailongBot:
             except OneBotError as e:
                 log.debug("撤回 %s 失败: %s", mid, e)
 
+    async def _backfill_captions(self) -> None:
+        """给图库里缺描述的图补写一句（一般是人工标注或打标签才进来的图；模型判定时会顺便写）。"""
+        if self.gallery is None or self._captioning:
+            return
+        self._captioning = True
+        try:
+            await asyncio.to_thread(self.gallery.sync)
+            missing = await asyncio.to_thread(self.gallery.missing_captions)
+            if missing:
+                log.info("开始为 %d 张图补写描述", len(missing))
+            for sha in missing:
+                path = self.store.find(sha)
+                if path is None:
+                    continue
+                try:
+                    data = await asyncio.to_thread(path.read_bytes)
+                    uri = await asyncio.to_thread(to_data_uri, data, self.cfg.frames)
+                except Exception as e:
+                    log.warning("补写描述时图片无法解析 %s: %s", sha[:12], e)
+                    continue
+                if text := await self.detector.describe(uri):
+                    self.cache.set_caption(sha, text)
+        finally:
+            self._captioning = False
+
     def _backfill_thumbs(self, days: int = 30) -> None:
         """启动时在后台给最近被撤回、还没有小图的图补上小图，让第一次 /wall 也快。单线程，不抢检测的资源。"""
         thumbs = self.store.root / "thumbs"
@@ -723,6 +1017,11 @@ def format_usage(u: Usage) -> str:
     if u.cached is None:
         return f"输入 {u.prompt}（缓存未知）· 输出 {u.completion}"
     return f"输入 {u.prompt} = 缓存 {u.cached} + 新 {u.new} · 输出 {u.completion}"
+
+
+def _chat_key(event: dict[str, Any]) -> tuple[int, int]:
+    """会话键：群聊按 (群号, 用户)，私聊按 (0, 用户)。"""
+    return event.get("group_id") or 0, event["user_id"]
 
 
 def plain_text(message: Any) -> str:

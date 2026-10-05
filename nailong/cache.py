@@ -18,6 +18,8 @@ class Verdict:
     usage: Any = None
     # 模型报告图中有试图左右审核结果、或在说明角色身份的文字（只用于记录和提示，不改变结论）
     injection: bool = False
+    # 一句话画面描述，供图库搜图参考
+    desc: str = ""
 
 
 @dataclass
@@ -85,6 +87,28 @@ class VerdictCache:
                 nailong INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS seen_log_time ON seen_log (time);
+            CREATE TABLE IF NOT EXISTS caption (
+                sha TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                time INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tag (
+                name TEXT PRIMARY KEY,
+                note TEXT NOT NULL DEFAULT '',
+                created INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS image_tag (
+                sha TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                source TEXT NOT NULL,        -- human / auto / rejected（人工去掉的自动标签，不再自动加回）
+                time INTEGER NOT NULL,
+                PRIMARY KEY (sha, tag)
+            );
+            CREATE TABLE IF NOT EXISTS gallery (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,   -- 图库里的永久编号，只增不减
+                sha TEXT UNIQUE NOT NULL,
+                added INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS setting (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -175,6 +199,114 @@ class VerdictCache:
 
     def labels_version(self) -> int:
         return int(self.get_setting("labels.version", 0))
+
+    def set_caption(self, sha: str, text: str) -> None:
+        """图片的一句话描述，供图库搜图参考。已有描述时不改：描述清单在图库请求里，中途改一条会让它后面的缓存失效。"""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO caption VALUES (?, ?, ?)",
+                (sha, text.strip()[:60], int(time.time())),
+            )
+            self._db.commit()
+
+    def captions(self) -> list[tuple[str, str]]:
+        """全部 (sha, 描述)，按加入时间从早到晚。"""
+        with self._lock:
+            return self._db.execute("SELECT sha, text FROM caption ORDER BY time, sha").fetchall()
+
+    # ---------- 标签 ----------
+
+    def upsert_tag(self, name: str, note: str | None = None) -> bool:
+        """新建标签或更新说明（note 为 None 时不改说明）。返回是否新建。"""
+        with self._lock:
+            exists = self._db.execute("SELECT 1 FROM tag WHERE name = ?", (name,)).fetchone() is not None
+            if not exists:
+                self._db.execute("INSERT INTO tag VALUES (?, ?, ?)", (name, note or "", int(time.time())))
+            elif note is not None:
+                self._db.execute("UPDATE tag SET note = ? WHERE name = ?", (note, name))
+            self._db.commit()
+        return not exists
+
+    def tags(self) -> list[dict[str, Any]]:
+        """全部标签及人工/自动数量，按创建时间。"""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT t.name, t.note,
+                          SUM(CASE WHEN i.source = 'human' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN i.source = 'auto' THEN 1 ELSE 0 END)
+                   FROM tag t LEFT JOIN image_tag i ON i.tag = t.name
+                   GROUP BY t.name ORDER BY t.created, t.name"""
+            ).fetchall()
+        return [{"name": n, "note": note, "human": h or 0, "auto": a or 0} for n, note, h, a in rows]
+
+    def tag_note(self, name: str) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT note FROM tag WHERE name = ?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def delete_tag(self, name: str) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM image_tag WHERE tag = ?", (name,))
+            self._db.execute("DELETE FROM tag WHERE name = ?", (name,))
+            self._db.commit()
+
+    def set_image_tag(self, sha: str, tag: str, source: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO image_tag VALUES (?, ?, ?, ?)", (sha, tag, source, int(time.time())))
+            self._db.commit()
+
+    def image_tags(self, sha: str) -> dict[str, str]:
+        """这张图的标签 -> 来源（不含 rejected）。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT tag, source FROM image_tag WHERE sha = ? AND source != 'rejected' ORDER BY time", (sha,)
+            ).fetchall()
+        return dict(rows)
+
+    def all_image_tags(self) -> dict[str, dict[str, str]]:
+        with self._lock:
+            rows = self._db.execute("SELECT sha, tag, source FROM image_tag WHERE source != 'rejected'").fetchall()
+        out: dict[str, dict[str, str]] = {}
+        for sha, tag, source in rows:
+            out.setdefault(sha, {})[tag] = source
+        return out
+
+    def tagged(self, tag: str) -> list[tuple[str, str]]:
+        """某标签下的 (sha, 来源)，人工的在前、各自按时间从新到旧。"""
+        with self._lock:
+            return self._db.execute(
+                """SELECT sha, source FROM image_tag WHERE tag = ? AND source != 'rejected'
+                   ORDER BY source = 'auto', time DESC""", (tag,)
+            ).fetchall()
+
+    def replace_auto_tags(self, tag: str, shas: list[str]) -> None:
+        """用新一轮自动推广的结果替换该标签的自动标签；人工标注和人工拒绝的不动。"""
+        now = int(time.time())
+        with self._lock:
+            self._db.execute("DELETE FROM image_tag WHERE tag = ? AND source = 'auto'", (tag,))
+            self._db.executemany(
+                "INSERT OR IGNORE INTO image_tag VALUES (?, ?, 'auto', ?)", [(sha, tag, now) for sha in shas]
+            )
+            self._db.commit()
+
+    def rejected(self, tag: str) -> set[str]:
+        with self._lock:
+            return {r[0] for r in self._db.execute(
+                "SELECT sha FROM image_tag WHERE tag = ? AND source = 'rejected'", (tag,))}
+
+    def gallery_add(self, shas: list[str]) -> int:
+        """按给定顺序追加到图库末尾（已在图库里的跳过），返回新增数量。"""
+        now = int(time.time())
+        with self._lock:
+            before = self._db.total_changes
+            self._db.executemany("INSERT OR IGNORE INTO gallery (sha, added) VALUES (?, ?)", [(s, now) for s in shas])
+            self._db.commit()
+            return self._db.total_changes - before
+
+    def gallery_list(self) -> list[tuple[int, str]]:
+        """图库里的 (编号, sha)，按编号。"""
+        with self._lock:
+            return self._db.execute("SELECT id, sha FROM gallery ORDER BY id").fetchall()
 
     def keys_for(self, sha: str) -> list[str]:
         with self._lock:
